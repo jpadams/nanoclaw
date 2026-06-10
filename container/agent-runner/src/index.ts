@@ -407,7 +407,8 @@ async function runQuery(
         'TeamCreate', 'TeamDelete', 'SendMessage',
         'TodoWrite', 'ToolSearch', 'Skill',
         'NotebookEdit',
-        'mcp__nanoclaw__*'
+        'mcp__nanoclaw__*',
+        'mcp__neo4j__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -423,6 +424,18 @@ async function runQuery(
             NANOCLAW_IS_MAIN: containerInput.isMain ? '1' : '0',
           },
         },
+        ...(process.env.NEO4J_URI ? {
+          neo4j: {
+            command: 'neo4j-mcp',
+            args: [],
+            env: {
+              NEO4J_URI: process.env.NEO4J_URI,
+              NEO4J_USERNAME: process.env.NEO4J_USERNAME || '',
+              NEO4J_PASSWORD: process.env.NEO4J_PASSWORD || '',
+              NEO4J_DATABASE: process.env.NEO4J_DATABASE || 'neo4j',
+            },
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],

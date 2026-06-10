@@ -33,6 +33,10 @@ ENV PLAYWRIGHT_CHROMIUM_EXECUTABLE_PATH=/usr/bin/chromium
 # Install agent-browser and claude-code globally
 RUN npm install -g agent-browser @anthropic-ai/claude-code
 
+# Install neo4j-mcp binary
+COPY neo4j-mcp /usr/local/bin/neo4j-mcp
+RUN chmod +x /usr/local/bin/neo4j-mcp
+
 # Create app directory
 WORKDIR /app
 
