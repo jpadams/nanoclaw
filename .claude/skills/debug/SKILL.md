@@ -175,6 +175,41 @@ mounts.push({
 
 If an MCP server fails to start, the agent may exit. Check the container logs for MCP initialization errors.
 
+### 7. Not Responding to Messages (Messages in DB, No Container Triggered)
+
+**Symptoms:** WhatsApp is connected, messages are visible in the app, but no response. No recent container logs.
+
+**Diagnosis:**
+
+```bash
+# Check if messages exist in DB but haven't been processed
+node --input-type=module <<'EOF'
+import Database from 'better-sqlite3';
+const db = new Database('./store/messages.db');
+const state = db.prepare("SELECT * FROM router_state").all();
+const lastTs = state.find(r => r.key === 'last_timestamp')?.value || '';
+console.log('last_timestamp:', lastTs);
+const pending = db.prepare(
+  "SELECT count(*) as cnt FROM messages WHERE timestamp > ? AND is_bot_message = 0"
+).get(lastTs);
+console.log('Pending user messages:', pending.cnt);
+EOF
+```
+
+If `Pending user messages` > 0 but no container is running, the message loop's in-memory cursor has diverged from the DB.
+
+**Also check:** The `logs/nanoclaw.error.log` FATAL errors ("Container runtime failed to start") are usually from **previous crashed runs**, not the current process. Don't be misled by them — check the service PID: `systemctl --user status nanoclaw`.
+
+**Fix:** Restart the service. `recoverPendingMessages()` runs at startup and immediately picks up any messages that are in the DB but not yet processed.
+
+```bash
+systemctl --user restart nanoclaw
+# Verify recovery kicks in:
+tail -f logs/nanoclaw.log | grep -E "Recovery|Processing messages|New messages"
+```
+
+**Root cause:** After long-running sessions (especially those with a WhatsApp disconnect/reconnect), the message loop's in-memory `lastTimestamp` can diverge from what `getNewMessages()` needs to return results, while the DB shows the old value. A restart resets everything cleanly.
+
 ## Manual Container Testing
 
 ### Test the full agent flow:
@@ -346,4 +381,17 @@ ls -t groups/*/logs/container-*.log 2>/dev/null | head -3 || echo "No container 
 echo -e "\n8. Session continuity working?"
 SESSIONS=$(grep "Session initialized" logs/nanoclaw.log 2>/dev/null | tail -5 | awk '{print $NF}' | sort -u | wc -l)
 [ "$SESSIONS" -le 2 ] && echo "OK (recent sessions reusing IDs)" || echo "CHECK - multiple different session IDs, may indicate resumption issues"
+
+echo -e "\n9. Pending unprocessed messages?"
+node --input-type=module <<'JSEOF' 2>/dev/null || echo "SKIP - node/better-sqlite3 not available"
+import Database from 'better-sqlite3';
+const db = new Database('./store/messages.db');
+const lastTs = db.prepare("SELECT value FROM router_state WHERE key='last_timestamp'").get()?.value || '';
+const cnt = db.prepare("SELECT count(*) as c FROM messages WHERE timestamp > ? AND is_bot_message = 0").get(lastTs).c;
+if (cnt > 0) {
+  console.log(\`STALE - \${cnt} user message(s) in DB newer than last_timestamp (\${lastTs}) — restart service to recover\`);
+} else {
+  console.log("OK");
+}
+JSEOF
 ```

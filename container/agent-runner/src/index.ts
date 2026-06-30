@@ -16,8 +16,54 @@
 
 import fs from 'fs';
 import path from 'path';
+import { createRequire } from 'module';
 import { query, HookCallback, PreCompactHookInput } from '@anthropic-ai/claude-agent-sdk';
 import { fileURLToPath } from 'url';
+
+// ── NAMS per-turn logging ──────────────────────────────────────────────────
+
+function extractUserText(prompt: string): string {
+  const m = prompt.match(/<message\b[^>]*>([\s\S]+?)<\/message>/);
+  return m ? m[1].trim() : prompt.trim();
+}
+
+async function namsCreateConversation(): Promise<string> {
+  if (!process.env.NAMS_API_KEY) return '';
+  try {
+    const resp = await fetch('https://memory.neo4jlabs.com/v1/conversations', {
+      method: 'POST',
+      headers: {
+        Authorization: `Bearer ${process.env.NAMS_API_KEY}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ user_id: 'jeremy.adams.pdx@gmail.com' }),
+    });
+    const data = await resp.json() as { id?: string };
+    log(`NAMS conversation created: ${data.id}`);
+    return data.id ?? '';
+  } catch (e) {
+    log(`NAMS create conversation error: ${e}`);
+    return '';
+  }
+}
+
+function namsAddTurn(convId: string, userText: string, assistantText: string): void {
+  if (!convId || !userText || !assistantText || !process.env.NAMS_API_KEY) return;
+  fetch(`https://memory.neo4jlabs.com/v1/conversations/${convId}/messages/bulk`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${process.env.NAMS_API_KEY}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      messages: [
+        { role: 'user',      content: userText },
+        { role: 'assistant', content: assistantText },
+      ],
+    }),
+  }).then(r => { if (!r.ok) log(`NAMS turn upload failed: ${r.status}`); })
+    .catch(e => log(`NAMS turn upload error: ${e}`));
+}
 
 interface ContainerInput {
   prompt: string;
@@ -57,6 +103,7 @@ interface SDKUserMessage {
 const IPC_INPUT_DIR = '/workspace/ipc/input';
 const IPC_INPUT_CLOSE_SENTINEL = path.join(IPC_INPUT_DIR, '_close');
 const IPC_POLL_MS = 500;
+const MCP_REMOTE_PATH = createRequire(import.meta.url).resolve('mcp-remote/dist/proxy.js');
 
 /**
  * Push-based async iterable for streaming user messages to the SDK.
@@ -336,9 +383,12 @@ async function runQuery(
   containerInput: ContainerInput,
   sdkEnv: Record<string, string | undefined>,
   resumeAt?: string,
+  namsConvId?: string,
+  userText?: string,
 ): Promise<{ newSessionId?: string; lastAssistantUuid?: string; closedDuringQuery: boolean }> {
   const stream = new MessageStream();
   stream.push(prompt);
+  const assistantTextParts: string[] = [];
 
   // Poll IPC for follow-up messages and _close sentinel during the query
   let ipcPolling = true;
@@ -409,6 +459,7 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__neo4j__*',
+        'mcp__nams-memory__*',
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -436,6 +487,17 @@ async function runQuery(
             },
           },
         } : {}),
+        ...(process.env.NAMS_API_KEY ? {
+          'nams-memory': {
+            command: 'node',
+            args: [
+              MCP_REMOTE_PATH,
+              'https://memory.neo4jlabs.com/mcp',
+              '--header',
+              `Authorization:Bearer ${process.env.NAMS_API_KEY}`,
+            ],
+          },
+        } : {}),
       },
       hooks: {
         PreCompact: [{ hooks: [createPreCompactHook(containerInput.assistantName)] }],
@@ -448,6 +510,16 @@ async function runQuery(
 
     if (message.type === 'assistant' && 'uuid' in message) {
       lastAssistantUuid = (message as { uuid: string }).uuid;
+    }
+
+    if (message.type === 'assistant' && 'message' in message) {
+      const content = (message as { message?: { content?: unknown[] } }).message?.content ?? [];
+      for (const block of content) {
+        if (typeof block === 'object' && block !== null && (block as { type?: string }).type === 'text') {
+          const text = (block as { text?: string }).text;
+          if (text) assistantTextParts.push(text);
+        }
+      }
     }
 
     if (message.type === 'system' && message.subtype === 'init') {
@@ -464,6 +536,7 @@ async function runQuery(
       resultCount++;
       const textResult = 'result' in message ? (message as { result?: string }).result : null;
       log(`Result #${resultCount}: subtype=${message.subtype}${textResult ? ` text=${textResult.slice(0, 200)}` : ''}`);
+      namsAddTurn(namsConvId ?? '', userText ?? '', assistantTextParts.join('\n\n'));
       writeOutput({
         status: 'success',
         result: textResult || null,
@@ -520,11 +593,12 @@ async function main(): Promise<void> {
 
   // Query loop: run query → wait for IPC message → run new query → repeat
   let resumeAt: string | undefined;
+  const namsConvId = await namsCreateConversation();
   try {
     while (true) {
       log(`Starting query (session: ${sessionId || 'new'}, resumeAt: ${resumeAt || 'latest'})...`);
 
-      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt);
+      const queryResult = await runQuery(prompt, sessionId, mcpServerPath, containerInput, sdkEnv, resumeAt, namsConvId, extractUserText(prompt));
       if (queryResult.newSessionId) {
         sessionId = queryResult.newSessionId;
       }
@@ -554,6 +628,7 @@ async function main(): Promise<void> {
 
       log(`Got new message (${nextMessage.length} chars), starting new query`);
       prompt = nextMessage;
+      // namsConvId stays the same — same WhatsApp session
     }
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : String(err);

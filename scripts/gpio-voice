@@ -1,0 +1,414 @@
+#!/usr/bin/env python3
+"""
+GPIO push-to-talk for NanoClaw.
+
+Wiring:
+  Button: one leg → GPIO BUTTON_PIN, other leg → GND  (internal pull-up used)
+  LED:    GPIO LED_PIN → 220Ω resistor → GND
+
+Behaviour:
+  Press 1 → start recording, LED on
+  Press 2 → stop recording, LED off, then:
+    - If "booth XXX" found in transcript → write note to Pi Neo4j (works offline)
+      LED: 3 quick blinks on success
+    - Else if online → send to NanoClaw via IPC
+      LED: 1 slow blink on send
+    - Else offline + no booth → save to offline queue file
+
+Environment overrides:
+  BUTTON_PIN    GPIO BCM number for button      (default: 17)
+  LED_PIN       GPIO BCM number for LED         (default: 27)
+  WHISPER_BIN   path to whisper-cli binary
+  WHISPER_MODEL path to ggml model file
+  MIC_DEVICE    ALSA device string              (default: hw:3,0)
+  TARGET_JID    WhatsApp JID to send to
+  NANOCLAW_DIR  root of nanoclaw install
+  NEO4J_HTTP    Pi Neo4j HTTP URL               (default: http://localhost:7474)
+  NEO4J_USER    Pi Neo4j username               (default: neo4j)
+  NEO4J_PASS    Pi Neo4j password               (default: password)
+  GPIO_CHIP     gpiochip device                 (default: /dev/gpiochip0)
+"""
+
+import base64
+import gpiod
+import json
+import logging
+import os
+import re
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import urllib.request
+import urllib.error
+from datetime import timedelta, datetime, timezone
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BUTTON_PIN    = int(os.environ.get("BUTTON_PIN",    "17"))
+LED_PIN       = int(os.environ.get("LED_PIN",       "27"))
+WHISPER_BIN   = os.environ.get("WHISPER_BIN",   "/home/jeremy/whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "/home/jeremy/nanoclaw/data/models/ggml-tiny.en.bin")
+MIC_DEVICE    = os.environ.get("MIC_DEVICE",    "hw:3,0")
+TARGET_JID    = os.environ.get("TARGET_JID",    "15032096346@s.whatsapp.net")
+NANOCLAW_DIR  = os.environ.get("NANOCLAW_DIR",  "/home/jeremy/nanoclaw")
+NEO4J_HTTP    = os.environ.get("NEO4J_HTTP",    "http://localhost:7474")
+NEO4J_USER    = os.environ.get("NEO4J_USER",    "neo4j")
+NEO4J_PASS    = os.environ.get("NEO4J_PASS",    "password")
+GPIO_CHIP     = os.environ.get("GPIO_CHIP",     "/dev/gpiochip0")
+
+IPC_DIR       = Path(NANOCLAW_DIR) / "data/ipc/whatsapp_main/tasks"
+OFFLINE_LOG   = Path(NANOCLAW_DIR) / "data/offline_notes.jsonl"
+DEBOUNCE_MS   = 80
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [gpio-voice] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ── State ─────────────────────────────────────────────────────────────────────
+recording    = False
+record_proc  = None
+audio_raw    = None
+audio_16k    = None
+whisper_prompt = ""   # built at startup from Pi Neo4j
+company_map    = {}   # lowercased name → booth code, built at startup
+
+# ── Connectivity ──────────────────────────────────────────────────────────────
+def is_online(host="8.8.8.8", port=53, timeout=1.5) -> bool:
+    """Return True if we can reach the internet (DNS port on Google's resolver)."""
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+# ── Neo4j HTTP helper ─────────────────────────────────────────────────────────
+def neo4j_query(cypher: str, params: dict = None):
+    """Run a Cypher statement against Pi Neo4j via HTTP API. Returns parsed response."""
+    creds = base64.b64encode(f"{NEO4J_USER}:{NEO4J_PASS}".encode()).decode()
+    url   = f"{NEO4J_HTTP}/db/neo4j/tx/commit"
+    body  = json.dumps({"statements": [{"statement": cypher,
+                                         "parameters": params or {}}]}).encode()
+    req   = urllib.request.Request(
+        url, data=body,
+        headers={"Content-Type": "application/json",
+                 "Authorization": f"Basic {creds}"},
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read())
+
+def wait_for_neo4j(max_wait=90, interval=3):
+    """Block until Neo4j responds or max_wait seconds elapse. Returns True if up."""
+    deadline = time.time() + max_wait
+    attempt  = 0
+    while time.time() < deadline:
+        try:
+            neo4j_query("RETURN 1")
+            log.info("Neo4j is ready (attempt %d)", attempt + 1)
+            return True
+        except Exception as exc:
+            attempt += 1
+            remaining = int(deadline - time.time())
+            log.info("Waiting for Neo4j (%ds left): %s", remaining, exc)
+            time.sleep(interval)
+    log.warning("Neo4j not available after %ds, continuing without it", max_wait)
+    return False
+
+# ── Whisper prompt from Pi Neo4j ──────────────────────────────────────────────
+def build_whisper_prompt(max_chars=900) -> str:
+    """
+    Query Pi Neo4j for all exhibitor booth/name pairs and build a compact
+    whisper --prompt string to improve recognition of booth codes and brand names.
+    Falls back to empty string if Neo4j is unreachable.
+    """
+    try:
+        result = neo4j_query(
+            "MATCH (e:Exhibitor) RETURN e.booth AS booth, e.name AS name "
+            "ORDER BY e.booth"
+        )
+        rows = result["results"][0]["data"]
+        pairs = [f"{r['row'][0]}={r['row'][1]}" for r in rows]
+        header = "AIEWF 2026 booth notes. Booths: "
+        prompt = header + ", ".join(pairs)
+        if len(prompt) > max_chars:
+            prompt = prompt[:max_chars].rsplit(",", 1)[0]
+        log.info("Whisper prompt built: %d chars, %d booths", len(prompt), len(rows))
+        return prompt
+    except Exception as exc:
+        log.warning("Could not build whisper prompt from Neo4j: %s", exc)
+        return ""
+
+def build_company_map() -> dict:
+    """Return {lowercased_name: booth} for all exhibitors. Used as fallback when booth code not spoken."""
+    try:
+        result = neo4j_query(
+            "MATCH (e:Exhibitor) RETURN e.booth AS booth, e.name AS name"
+        )
+        rows = result["results"][0]["data"]
+        return {r["row"][1].lower(): r["row"][0] for r in rows if r["row"][1]}
+    except Exception as exc:
+        log.warning("Could not build company map: %s", exc)
+        return {}
+
+# ── Booth extraction ───────────────────────────────────────────────────────────
+# Matches e.g. "booth P3", "Boothp3", "booth number U-G19", "booth LG 19"
+# \s* (not \s+) handles whisper merging "booth" and the code with no space
+BOOTH_RE = re.compile(
+    r'\bbooth\s*(?:number\s*)?'
+    r'((?:[LlUu]\s*[-–]?\s*[Gg]\s*[-–]?\s*\d+|[MmLlPpSsBb]\s*\d+))',
+    re.IGNORECASE,
+)
+
+def normalize_booth(raw: str) -> str:
+    """Normalize whisper output to canonical booth format: 'u g 19' → 'U-G19'."""
+    s = re.sub(r'[\s\-–]+', '', raw.upper())   # strip whitespace and dashes
+    s = re.sub(r'^([LU])G(\d+)$', r'\1-G\2', s)  # LG19 → L-G19, UG19 → U-G19
+    return s
+
+def extract_booth(text: str):
+    """Return normalized booth code if found in transcript, else None.
+    First tries booth code regex, then falls back to company name lookup."""
+    m = BOOTH_RE.search(text)
+    if m:
+        return normalize_booth(m.group(1))
+    # Fallback: scan for a known company name in the transcript
+    text_lower = text.lower()
+    for name, booth in company_map.items():
+        if re.search(r'\b' + re.escape(name) + r'\b', text_lower):
+            log.info("Matched company name '%s' → booth %s", name, booth)
+            return booth
+    return None
+
+# ── Note writing ──────────────────────────────────────────────────────────────
+def write_booth_note(booth: str, text: str) -> bool:
+    """
+    Append a timestamped note to the Exhibitor node for booth.
+    Returns True on success.
+    """
+    ts = datetime.now().strftime("%Y-%m-%dT%H:%M:%S")
+    try:
+        result = neo4j_query(
+            """
+            MATCH (e:Exhibitor {booth: $booth})
+            SET e.notes = CASE
+                WHEN e.notes IS NULL THEN $note
+                ELSE e.notes + '\n' + $note
+            END,
+            e.updated_at = datetime()
+            RETURN e.name AS name
+            """,
+            {"booth": booth, "note": f"[{ts}] {text}"},
+        )
+        rows = result["results"][0]["data"]
+        if rows:
+            log.info("Note saved to booth %s (%s)", booth, rows[0]["row"][0])
+            return True
+        else:
+            log.warning("Booth %s not found in Neo4j", booth)
+            return False
+    except Exception as exc:
+        log.error("Failed to write note to Neo4j: %s", exc)
+        return False
+
+def save_offline(text: str):
+    """Append unrouted offline note to JSONL queue for later processing."""
+    OFFLINE_LOG.parent.mkdir(parents=True, exist_ok=True)
+    entry = {"ts": datetime.now().isoformat(), "text": text}
+    with open(OFFLINE_LOG, "a") as f:
+        f.write(json.dumps(entry) + "\n")
+    log.info("Saved to offline queue: %s", OFFLINE_LOG)
+
+# ── GPIO setup ────────────────────────────────────────────────────────────────
+def open_gpio():
+    chip = gpiod.Chip(GPIO_CHIP)
+    req  = chip.request_lines(
+        config={
+            BUTTON_PIN: gpiod.LineSettings(
+                direction=gpiod.line.Direction.INPUT,
+                bias=gpiod.line.Bias.PULL_UP,
+                edge_detection=gpiod.line.Edge.FALLING,
+                debounce_period=timedelta(milliseconds=DEBOUNCE_MS),
+            ),
+            LED_PIN: gpiod.LineSettings(
+                direction=gpiod.line.Direction.OUTPUT,
+                output_value=gpiod.line.Value.INACTIVE,
+            ),
+        },
+        consumer="nanoclaw-voice",
+    )
+    return chip, req
+
+def set_led(req, on: bool):
+    req.set_value(LED_PIN,
+                  gpiod.line.Value.ACTIVE if on else gpiod.line.Value.INACTIVE)
+
+def blink_led(req, count=3, on_ms=150, off_ms=150):
+    """Blink LED count times."""
+    for _ in range(count):
+        set_led(req, True)
+        time.sleep(on_ms / 1000)
+        set_led(req, False)
+        time.sleep(off_ms / 1000)
+
+# ── Audio helpers ─────────────────────────────────────────────────────────────
+def start_recording(req):
+    global recording, record_proc, audio_raw, audio_16k
+    audio_raw  = tempfile.mktemp(prefix="/tmp/voice-raw-", suffix=".wav")
+    audio_16k  = tempfile.mktemp(prefix="/tmp/voice-16k-", suffix=".wav")
+    record_proc = subprocess.Popen(
+        ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "16000", "-c", "1", "-q", audio_raw],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    set_led(req, on=True)
+    recording = True
+    log.info("Recording started → %s", audio_raw)
+
+def stop_recording(req):
+    global recording, record_proc
+    if record_proc:
+        record_proc.terminate()
+        try:
+            record_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            record_proc.kill()
+        record_proc = None
+    set_led(req, on=False)
+    recording = False
+    log.info("Recording stopped")
+
+# ── Transcribe + route ────────────────────────────────────────────────────────
+NOISE = re.compile(r"^\s*(\[.*?\]|\(.*?\)|\*.*?\*)\s*$")
+
+def transcribe_and_route(req):
+    global audio_raw, audio_16k
+
+    log.info("Converting audio…")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", audio_raw, "-ar", "16000", "-ac", "1",
+         audio_16k, "-loglevel", "quiet"],
+        check=True,
+    )
+
+    log.info("Transcribing…")
+    cmd = [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", audio_16k,
+           "--no-timestamps", "--language", "en"]
+    if whisper_prompt:
+        cmd += ["--prompt", whisper_prompt]
+
+    result = subprocess.run(cmd, capture_output=True, text=True)
+
+    lines = [ln for ln in result.stdout.splitlines() if not NOISE.match(ln)]
+    text  = " ".join(lines).strip()
+
+    if not text:
+        log.warning("No speech detected — nothing sent.")
+        return
+
+    log.info("Transcribed: %s", text)
+
+    # ── Route 1: booth note → Pi Neo4j (offline-capable) ──────────────────
+    booth = extract_booth(text)
+    if booth:
+        log.info("Booth detected: %s — writing to Neo4j", booth)
+        if write_booth_note(booth, text):
+            blink_led(req, count=3, on_ms=150, off_ms=100)   # 3 quick blinks = saved
+        else:
+            log.warning("Neo4j write failed for booth %s — saving to offline queue", booth)
+            save_offline(text)
+            blink_led(req, count=5, on_ms=80, off_ms=80)     # rapid blink = queued
+        return
+
+    # ── Route 2: conversational → IPC → NanoClaw (needs internet) ─────────
+    if is_online():
+        log.info("Online — sending to NanoClaw via IPC")
+        IPC_DIR.mkdir(parents=True, exist_ok=True)
+        task_id        = f"voice-{int(time.time_ns() // 1000):016d}"
+        schedule_value = (
+            datetime.now(timezone.utc) + timedelta(seconds=2)
+        ).strftime("%Y-%m-%dT%H:%M:%SZ")
+        payload   = {
+            "type":           "schedule_task",
+            "prompt":         text,
+            "schedule_type":  "once",
+            "schedule_value": schedule_value,
+            "targetJid":      TARGET_JID,
+            "context_mode":   "group",
+        }
+        task_file = IPC_DIR / f"{task_id}.json"
+        tmp_file  = IPC_DIR / f"{task_id}.json.tmp"
+        tmp_file.write_text(json.dumps(payload))
+        tmp_file.rename(task_file)
+        log.info("Sent to NanoClaw → %s", task_file.name)
+        blink_led(req, count=1, on_ms=500, off_ms=0)          # 1 slow blink = sent
+    else:
+        # ── Route 3: offline + no booth → save to queue ────────────────────
+        log.warning("Offline and no booth code — saving to queue")
+        save_offline(text)
+        blink_led(req, count=2, on_ms=300, off_ms=300)        # 2 medium blinks = queued
+
+    # Cleanup temp files
+    for f in [audio_raw, audio_16k]:
+        try:
+            Path(f).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+# ── Main ──────────────────────────────────────────────────────────────────────
+def main():
+    global whisper_prompt, company_map
+
+    if not Path(WHISPER_BIN).is_file():
+        log.error("whisper-cli not found: %s", WHISPER_BIN)
+        sys.exit(1)
+    if not Path(WHISPER_MODEL).is_file():
+        log.error("Whisper model not found: %s", WHISPER_MODEL)
+        sys.exit(1)
+
+    whisper_prompt = build_whisper_prompt()
+    company_map    = build_company_map()
+    log.info("Company map built: %d entries", len(company_map))
+
+    chip, req = open_gpio()
+    log.info(
+        "GPIO ready — button=GPIO%d  LED=GPIO%d  mic=%s  online=%s",
+        BUTTON_PIN, LED_PIN, MIC_DEVICE, is_online(),
+    )
+    log.info("Waiting for button press…")
+
+    def shutdown(sig, frame):
+        log.info("Shutting down (signal %d)", sig)
+        if recording:
+            stop_recording(req)
+        req.release()
+        chip.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT,  shutdown)
+
+    while True:
+        if req.wait_edge_events(timeout=timedelta(seconds=1)):
+            for event in req.read_edge_events():
+                if event.line_offset != BUTTON_PIN:
+                    continue
+                if not recording:
+                    log.info("Button pressed → starting recording")
+                    start_recording(req)
+                else:
+                    log.info("Button pressed → stopping recording")
+                    stop_recording(req)
+                    try:
+                        transcribe_and_route(req)
+                    except Exception as exc:
+                        log.error("Transcribe/route failed: %s", exc)
+                        blink_led(req, count=5, on_ms=80, off_ms=80)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,220 @@
+#!/usr/bin/env python3
+"""
+GPIO push-to-talk for NanoClaw.
+
+Wiring:
+  Button: one leg → GPIO BUTTON_PIN, other leg → GND  (internal pull-up used)
+  LED:    GPIO LED_PIN → 220Ω resistor → GND
+
+Behaviour:
+  Press 1 → start recording, LED on
+  Press 2 → stop recording, LED off, transcribe with whisper.cpp, send to NanoClaw via IPC
+
+Environment overrides (same as the 'voice' bash script):
+  BUTTON_PIN    GPIO BCM number for button  (default: 17)
+  LED_PIN       GPIO BCM number for LED     (default: 27)
+  WHISPER_BIN   path to whisper-cli binary
+  WHISPER_MODEL path to ggml model file
+  MIC_DEVICE    ALSA device string          (default: hw:3,0)
+  TARGET_JID    WhatsApp JID to send to
+  NANOCLAW_DIR  root of nanoclaw install
+"""
+
+import gpiod
+import json
+import logging
+import os
+import re
+import signal
+import subprocess
+import sys
+import tempfile
+import time
+from datetime import timedelta, datetime, timezone
+from pathlib import Path
+
+# ── Config ────────────────────────────────────────────────────────────────────
+BUTTON_PIN    = int(os.environ.get("BUTTON_PIN",    "17"))
+LED_PIN       = int(os.environ.get("LED_PIN",       "27"))
+WHISPER_BIN   = os.environ.get("WHISPER_BIN",   "/home/jeremy/whisper.cpp/build/bin/whisper-cli")
+WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "/home/jeremy/nanoclaw/data/models/ggml-tiny.en.bin")
+MIC_DEVICE    = os.environ.get("MIC_DEVICE",    "hw:3,0")
+TARGET_JID    = os.environ.get("TARGET_JID",    "15032096346@s.whatsapp.net")
+NANOCLAW_DIR  = os.environ.get("NANOCLAW_DIR",  "/home/jeremy/nanoclaw")
+IPC_DIR       = Path(NANOCLAW_DIR) / "data/ipc/whatsapp_main/tasks"
+
+DEBOUNCE_MS   = 80    # ignore bounces shorter than this
+GPIO_CHIP     = "/dev/gpiochip0"
+
+# ── Logging ───────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [gpio-voice] %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
+
+# ── State ─────────────────────────────────────────────────────────────────────
+recording    = False
+record_proc  = None
+audio_raw    = None
+audio_16k    = None
+
+# ── GPIO setup ────────────────────────────────────────────────────────────────
+def open_gpio():
+    chip = gpiod.Chip(GPIO_CHIP)
+
+    button_settings = gpiod.LineSettings(
+        direction=gpiod.line.Direction.INPUT,
+        bias=gpiod.line.Bias.PULL_UP,
+        edge_detection=gpiod.line.Edge.FALLING,
+        debounce_period=timedelta(milliseconds=DEBOUNCE_MS),
+    )
+    led_settings = gpiod.LineSettings(
+        direction=gpiod.line.Direction.OUTPUT,
+        output_value=gpiod.line.Value.INACTIVE,
+    )
+
+    req = chip.request_lines(
+        config={BUTTON_PIN: button_settings, LED_PIN: led_settings},
+        consumer="nanoclaw-voice",
+    )
+    return chip, req
+
+
+def set_led(req, on: bool):
+    val = gpiod.line.Value.ACTIVE if on else gpiod.line.Value.INACTIVE
+    req.set_value(LED_PIN, val)
+
+
+# ── Audio helpers ─────────────────────────────────────────────────────────────
+def start_recording(req):
+    global recording, record_proc, audio_raw, audio_16k
+    audio_raw = tempfile.mktemp(prefix="/tmp/voice-raw-", suffix=".wav")
+    audio_16k = tempfile.mktemp(prefix="/tmp/voice-16k-", suffix=".wav")
+
+    record_proc = subprocess.Popen(
+        ["arecord", "-D", MIC_DEVICE, "-f", "S16_LE", "-r", "16000", "-c", "1", "-q", audio_raw],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    set_led(req, on=True)
+    recording = True
+    log.info("Recording started → %s", audio_raw)
+
+
+def stop_recording(req):
+    global recording, record_proc
+    if record_proc:
+        record_proc.terminate()
+        try:
+            record_proc.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            record_proc.kill()
+        record_proc = None
+    set_led(req, on=False)
+    recording = False
+    log.info("Recording stopped")
+
+
+def transcribe_and_send():
+    global audio_raw, audio_16k
+
+    log.info("Converting audio…")
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", audio_raw, "-ar", "16000", "-ac", "1", audio_16k, "-loglevel", "quiet"],
+        check=True,
+    )
+
+    log.info("Transcribing…")
+    result = subprocess.run(
+        [WHISPER_BIN, "-m", WHISPER_MODEL, "-f", audio_16k,
+         "--no-timestamps", "--language", "en"],
+        capture_output=True, text=True,
+    )
+
+    NOISE = re.compile(
+        r"^\s*(\[BLANK_AUDIO\]|\(upbeat music\)|\(music\)|Thank you\.|Thanks for watching\.?)\s*$"
+    )
+    lines = [ln for ln in result.stdout.splitlines() if not NOISE.match(ln)]
+    text  = " ".join(lines).strip()
+
+    if not text:
+        log.warning("No speech detected — nothing sent.")
+        return
+
+    log.info("Transcribed: %s", text)
+
+    IPC_DIR.mkdir(parents=True, exist_ok=True)
+    task_id        = f"voice-{int(time.time_ns() // 1000):016d}"
+    schedule_value = (
+        datetime.now(timezone.utc) + timedelta(seconds=2)
+    ).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    payload  = {
+        "type":           "schedule_task",
+        "prompt":         text,
+        "schedule_type":  "once",
+        "schedule_value": schedule_value,
+        "targetJid":      TARGET_JID,
+        "context_mode":   "group",
+    }
+    task_file = IPC_DIR / f"{task_id}.json"
+    tmp_file  = IPC_DIR / f"{task_id}.json.tmp"
+    tmp_file.write_text(json.dumps(payload))
+    tmp_file.rename(task_file)
+    log.info("Sent to NanoClaw → %s", task_file.name)
+
+    for f in [audio_raw, audio_16k]:
+        try:
+            Path(f).unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+# ── Main loop ─────────────────────────────────────────────────────────────────
+def main():
+    if not Path(WHISPER_BIN).is_file():
+        log.error("whisper-cli not found: %s", WHISPER_BIN)
+        sys.exit(1)
+    if not Path(WHISPER_MODEL).is_file():
+        log.error("Whisper model not found: %s", WHISPER_MODEL)
+        sys.exit(1)
+
+    chip, req = open_gpio()
+    log.info(
+        "GPIO ready — button=GPIO%d  LED=GPIO%d  mic=%s",
+        BUTTON_PIN, LED_PIN, MIC_DEVICE,
+    )
+    log.info("Waiting for button press…")
+
+    def shutdown(sig, frame):
+        log.info("Shutting down (signal %d)", sig)
+        if recording:
+            stop_recording(req)
+        req.release()
+        chip.close()
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT,  shutdown)
+
+    while True:
+        if req.wait_edge_events(timeout=timedelta(seconds=1)):
+            for event in req.read_edge_events():
+                if event.line_offset != BUTTON_PIN:
+                    continue
+                if not recording:
+                    log.info("Button pressed → starting recording")
+                    start_recording(req)
+                else:
+                    log.info("Button pressed → stopping recording")
+                    stop_recording(req)
+                    try:
+                        transcribe_and_send()
+                    except Exception as exc:
+                        log.error("Transcribe/send failed: %s", exc)
+
+
+if __name__ == "__main__":
+    main()

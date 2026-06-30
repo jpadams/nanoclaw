@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+# Push-to-talk voice input for NanoClaw.
+# Press ENTER to start recording, ENTER again to stop.
+# Transcribes locally with whisper.cpp, then sends to the agent via IPC.
+
+set -euo pipefail
+
+WHISPER_BIN="${WHISPER_BIN:-/home/jeremy/whisper.cpp/build/bin/whisper-cli}"
+WHISPER_MODEL="${WHISPER_MODEL:-/home/jeremy/nanoclaw/data/models/ggml-tiny.en.bin}"
+MIC_DEVICE="${MIC_DEVICE:-hw:3,0}"
+TARGET_JID="${TARGET_JID:-15032096346@s.whatsapp.net}"
+NANOCLAW_DIR="${NANOCLAW_DIR:-/home/jeremy/nanoclaw}"
+IPC_DIR="$NANOCLAW_DIR/data/ipc/whatsapp_main/tasks"
+
+AUDIO_RAW=$(mktemp /tmp/voice-raw-XXXX.wav)
+AUDIO_16K=$(mktemp /tmp/voice-16k-XXXX.wav)
+RECORD_PID=""
+
+cleanup() {
+  [[ -n "$RECORD_PID" ]] && kill "$RECORD_PID" 2>/dev/null || true
+  rm -f "$AUDIO_RAW" "$AUDIO_16K"
+}
+trap cleanup EXIT INT TERM
+
+# ── Preflight ────────────────────────────────────────────────────────────────
+if [[ ! -x "$WHISPER_BIN" ]]; then
+  echo "whisper-cli not found at $WHISPER_BIN"
+  echo "Build whisper.cpp first: cd ~/whisper.cpp && cmake --build build -j4"
+  exit 1
+fi
+if [[ ! -f "$WHISPER_MODEL" ]]; then
+  echo "Model not found at $WHISPER_MODEL"
+  echo "Download: curl -L -o $WHISPER_MODEL https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin"
+  exit 1
+fi
+
+# ── Record ───────────────────────────────────────────────────────────────────
+echo ""
+echo "Press ENTER to start recording..."
+read -r
+
+echo "Recording... (Press ENTER to stop)"
+arecord -D "$MIC_DEVICE" -f S16_LE -r 16000 -c 1 -q "$AUDIO_RAW" &
+RECORD_PID=$!
+read -r
+kill "$RECORD_PID" 2>/dev/null || true
+wait "$RECORD_PID" 2>/dev/null || true
+RECORD_PID=""
+
+# ── Convert to 16 kHz mono WAV (whisper.cpp requirement) ────────────────────
+ffmpeg -y -i "$AUDIO_RAW" -ar 16000 -ac 1 "$AUDIO_16K" -loglevel quiet
+
+# ── Transcribe ───────────────────────────────────────────────────────────────
+echo "Transcribing..."
+RAW_TEXT=$(
+  "$WHISPER_BIN" \
+    -m "$WHISPER_MODEL" \
+    -f "$AUDIO_16K" \
+    --no-timestamps \
+    --language en \
+    2>/dev/null || true
+)
+
+# Strip whisper.cpp noise: blank audio markers, common silence hallucinations
+TEXT=$(echo "$RAW_TEXT" \
+  | grep -v -E '^\s*(\[BLANK_AUDIO\]|\(upbeat music\)|\(music\)|Thank you\.|Thanks for watching\.?)\s*$' \
+  | tr '\n' ' ' \
+  | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+
+if [[ -z "$TEXT" ]]; then
+  echo "No speech detected."
+  exit 0
+fi
+
+echo ""
+echo "You said: $TEXT"
+echo ""
+
+# ── Send to NanoClaw agent via IPC schedule_task ─────────────────────────────
+mkdir -p "$IPC_DIR"
+TASK_ID="voice-$(date +%s%N | cut -c1-16)"
+SCHEDULE_VALUE=$(date -u --date='+2 seconds' +%Y-%m-%dT%H:%M:%SZ)
+TASK_FILE="$IPC_DIR/${TASK_ID}.json"
+
+python3 -c "
+import json, sys
+data = {
+    'type': 'schedule_task',
+    'prompt': sys.argv[1],
+    'schedule_type': 'once',
+    'schedule_value': sys.argv[2],
+    'targetJid': sys.argv[3],
+    'context_mode': 'group'
+}
+print(json.dumps(data))
+" "$TEXT" "$SCHEDULE_VALUE" "$TARGET_JID" > "${TASK_FILE}.tmp"
+mv "${TASK_FILE}.tmp" "$TASK_FILE"
+
+echo "Sent to NanoClaw. Response will arrive via WhatsApp."

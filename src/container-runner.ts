@@ -30,7 +30,14 @@ import { readEnvFile } from './env.js';
 import { validateAdditionalMounts } from './mount-security.js';
 import { RegisteredGroup } from './types.js';
 
-const neo4jEnv = readEnvFile(['NEO4J_URI', 'NEO4J_USERNAME', 'NEO4J_PASSWORD', 'NEO4J_DATABASE']);
+const neo4jEnv = readEnvFile([
+  'NEO4J_URI',
+  'NEO4J_USERNAME',
+  'NEO4J_PASSWORD',
+  'NEO4J_DATABASE',
+]);
+
+const namsEnv = readEnvFile(['NAMS_API_KEY']);
 
 // Sentinel markers for robust output parsing (must match agent-runner)
 const OUTPUT_START_MARKER = '---NANOCLAW_OUTPUT_START---';
@@ -231,11 +238,22 @@ function buildContainerArgs(
   );
 
   // Pass Neo4j credentials for the neo4j MCP server
-  for (const key of ['NEO4J_URI', 'NEO4J_USERNAME', 'NEO4J_PASSWORD', 'NEO4J_DATABASE']) {
+  for (const key of [
+    'NEO4J_URI',
+    'NEO4J_USERNAME',
+    'NEO4J_PASSWORD',
+    'NEO4J_DATABASE',
+  ]) {
     const value = process.env[key] || neo4jEnv[key];
     if (value) {
       args.push('-e', `${key}=${value}`);
     }
+  }
+
+  // Pass NAMS API key for the nams-memory MCP server
+  const namsApiKey = process.env.NAMS_API_KEY || namsEnv['NAMS_API_KEY'];
+  if (namsApiKey) {
+    args.push('-e', `NAMS_API_KEY=${namsApiKey}`);
   }
 
   // Mirror the host's auth method with a placeholder value.
