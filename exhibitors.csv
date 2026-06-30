@@ -1,0 +1,131 @@
+booth,name,tier,notes
+"L-G1","Runpod","Gold","AI Infrastructure at developer speed"
+"L-G2","Turbopuffer","Gold","Search every byte"
+"L-G3","Stigg","Gold","Every AI request is a spend decision. Make it in milliseconds"
+"L-G4","YugabyteDB","Gold","Showcasing Meko — Your agents could be smarter TBH. The Data Infrastructure for Agents That Work and Learn Together. Knowledge, memory, conversations, and decision traces for multi-agent systems"
+"L-G5","Gravitee","Gold","One Agent Management Platform. Secure MCP Access. Cut LLM Cost, Trace Agent Traffic."
+"L-G6","Meticulous","Gold","Ship code at the speed your agents write it"
+"L-G7","Oxylabs","Gold","Fast-adapting infrastructure for web data"
+"L-G8","Daytona","Gold","Computers for agents"
+"L-G9","Orkes","Gold","Deterministic Agents"
+"L-G10","Datadog","Gold","Ship production-grade AI agents fast"
+"L-G11","Apache Druid","Gold","Fail or Gain, what's around the AI makes a difference."
+"L-G12","Snorkel AI","Gold",NULL
+"L-G13","RunLayer","Gold",NULL
+"L-G14","Cleric","Gold",NULL
+"L-G15","Sourcegraph","Gold",NULL
+"L-G16","Temporal","Gold",NULL
+"L-G17","BAND","Gold",NULL
+"L-G18","Snyk","Gold","Snyk. Build fearlessly in the AI era. Your agentic security orchestration system."
+"L-G19","Factory","Gold",NULL
+"L-G20","Keycard","Gold",NULL
+"L-G23","Qdrant","Gold",NULL
+"L-G24","Zed Industries","Gold",NULL
+"L-G27","Automattic","Gold",NULL
+"L-G28","Resolve AI","Gold",NULL
+"L-G29","Lightrun","Gold",NULL
+"L-G30","FriendliAI","Gold",NULL
+"L-G31","Baseten","Gold",NULL
+"L-G32","Circle","Gold",NULL
+"L-G33","Dynatrace","Gold",NULL
+"L-G34","Apify","Gold",NULL
+"L-G38","Airbyte","Gold",NULL
+"L-G39","Langfuse","Gold",NULL
+"L-G44","Replicated","Gold",NULL
+"L-G45","PlanetScale","Gold",NULL
+"L-G47","LlamaIndex","Gold",NULL
+"L-G48","Tessl","Gold","Skills are the new code. Treat them that way."
+"L-G49","Venice.ai","Gold",NULL
+"L-G50","Composio","Gold",NULL
+"L-G51","Exa","Gold",NULL
+"L-G52","Telnyx","Gold",NULL
+"L-G53","Deasy Labs","Gold",NULL
+"L-G54","LiveKit","Gold",NULL
+"L1","MiniMax","Lab Partner",NULL
+"L2","Z.ai","Lab Partner",NULL
+"L3","Amazon AGI SF Lab","Lab Partner",NULL
+"L5","Google DeepMind","Lab Partner",NULL
+"L6","OpenAI","Lab Partner",NULL
+"M1","Microsoft","Presenting",NULL
+"P1","Together AI","Platinum","The AI-native cloud. Deep research, peak token performance"
+"P2","WorkOS","Platinum","Infrastructure for Auth (authentication & authorization)."
+"P3","Neo4j","Platinum",NULL
+"P4","Arize AI","Platinum","The continual learning platform for agents."
+"P5","Browserbase","Platinum",NULL
+"P6","Qodo","Platinum",NULL
+"P7","Sonar","Platinum",NULL
+"P8","Reducto","Platinum",NULL
+"P9","Oracle","Platinum",NULL
+"P10","Braintrust","Platinum",NULL
+"P11","PayPal","Platinum",NULL
+"P12","Docker","Platinum",NULL
+"P13","Amazon Web Services","Platinum",NULL
+"P14","Akamai","Platinum",NULL
+"P15","Bright Data","Platinum","We turn the web into AI-ready data"
+"P16","Unblocked","Platinum",NULL
+"S1","Bem","Silver",NULL
+"S2","Mezmo","Silver",NULL
+"S3","CircleCI","Silver",NULL
+"S4","Modal","Silver",NULL
+"S5","Red Hat","Silver",NULL
+"S6","Deepgram","Silver",NULL
+"S7","Prolific","Silver",NULL
+"S8","Baz","Silver","AI code review, purpose-built coding agent for your pull requests."
+"S9","Descope","Silver",NULL
+"S10","Fiddler AI","Silver",NULL
+"S11","RELAI","Silver",NULL
+"S12","Tailscale","Silver","Tailscale. The secure connectivity platform for AI infrastructure."
+"S13","SurrealDB","Silver",NULL
+"S14","PromptQL","Silver",NULL
+"S15","Vapi","Silver","Vapi. Build voice agents at scale."
+"S16","Ref","Silver","Chats disappear, this isn't. Decisions shouldn't."
+"S17","Aikido Security","Silver","Self-securing software. Continuous validation and autonomous remediation."
+"S18","Revenium","Silver","Give your agents a budget. Control AI spend, know what's worth it."
+"S19","Superconductive","Silver",NULL
+"S20","Paper Compute","Silver","Turn dead tokens [into skills?] — tagline garbled, needs review."
+"S21","Extend","Silver",NULL
+"S22","Modem","Silver","The AI teammate that knows what your customers want."
+"S23","Box","Silver",NULL
+"S24","Zero","Silver",NULL
+"S25","Comet","Silver",NULL
+"S26","GrowthBook","Silver",NULL
+"S27","Auth0","Silver",NULL
+"S28","The Velocity Room","Silver",NULL
+"S29","Vast.ai","Silver",NULL
+"S30","Prior Labs","Silver","One model, infinite predictions."
+"S31","Solo.io","Silver",NULL
+"S32","Postman","Silver",NULL
+"S33","DigitalOcean","Silver",NULL
+"S34","Granica","Silver",NULL
+"S35","Flox","Silver","The deterministic foundation for AI workloads."
+"S36","Amp","Silver","Ampersand. The integration infrastructure for enterprise agents."
+"S37","Etched","Silver",NULL
+"S38","1Password","Silver","1Password. Secure access for humans, machines, and AI agents."
+"S39","Cognition","Silver",NULL
+"S40","PostHog","Silver",NULL
+"S41","Dash0","Silver",NULL
+"S42","Firecrawl","Silver",NULL
+"U-G1","Elastic","Upper Gold","Industry-leading search and retrieval for AI context"
+"U-G2","Atlassian","Upper Gold","Give agents a plan, not a prompt"
+"U-G3","DatologyAI","Upper Gold","The data workbench for AI model builders."
+"U-G4","Kimchi","Upper Gold","Prompt to PR, no babysitting. A complete coding platform running open source models."
+"U-G5","Cloudflare","Upper Gold","Agents never sleep"
+"U-G6","G2i","Upper Gold","The multi-agent coding platform for production quality code."
+"U-G7","Merge","Upper Gold","Thousands of tools for your agents. Intelligent auto-routing across any model provider"
+"U-G8","Daily","Upper Gold","Realtime voice, video, and AI at global scale"
+"U-G9","Coder","Upper Gold","Self-hosted governed environments for AI development. Your agents, your infrastructure and your AI models"
+"U-G10","Sentry","Upper Gold","Someone's gotta babysit the box. Keep your agents and MCP servers in check"
+"U-G11","Traversal","Upper Gold","Production that fixes itself. AI SRE"
+"U-G12","Crusoe","Upper Gold","Crusoe Cloud. AI optimized infra for training, fine-tuning, and inference."
+"U-G15","Fireworks AI","Upper Gold","Frontier training and inference platform"
+"U-G16","Greptile","Upper Gold","The war on bugs. AI agents that catch bugs in PRs"
+"U-G19","LangChain","Upper Gold","Observe, evaluate, and deploy your agents"
+"U-G20","Warp","Upper Gold",NULL
+"U-G21","Nebius","Upper Gold","Lightning fast inference at prodution scale"
+"U-G22","Optiver","Upper Gold","Built by engineers, proven by markets"
+"U-G23","AssemblyAI","Upper Gold","Build your next voice agent on our API"
+"U-G24","Weights & Biases","Upper Gold",NULL
+"U-G25","Twilio","Upper Gold",NULL
+"U-G26","Inngest","Upper Gold",NULL
+"U-G27","Buildkite","Upper Gold","BuildCite. The CI for AI. Parallel lives, fan out, and orchestrate at depth. A slightly faster runner won't cut it."
+"U-G28","Modular","Upper Gold",NULL
